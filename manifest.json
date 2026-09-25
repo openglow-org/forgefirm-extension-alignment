@@ -6,7 +6,7 @@
   "description": "The head camera's view with a crosshair and a jog pad beside it, and the beam moved to where the crosshair was, for LightBurn's Start From: Current Position.",
   "author": "OpenGlow",
   "license": "MIT",
-  "homepage": "https://docs.forgefirm.org/usage/alignment/",
+  "homepage": "https://docs.forgefirm.org/usage/extensions/alignment/",
   "api": "0.1",
   "runtime": "ui",
   "modes": ["grbl"],
