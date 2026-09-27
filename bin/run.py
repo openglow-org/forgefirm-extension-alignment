@@ -26,6 +26,14 @@ happens when the operator lets the sender back in from the panel, and a
 service that restarts in the middle of a use finishes it. A time the
 service was frozen (a job armed) does not count against the page.
 
+The tool moves the head only on a homed machine. A home turns on the
+controller's soft limits, and those are what refuse a move past the edge
+of the work area: unhomed, the position is only where the head stood when
+the controller started, and a move from there can drive the head into the
+frame. The calibration mark reaches past the spot in every direction, so
+the head traces its square first, without the laser, and a mark that does
+not fit is refused before anything burns.
+
 `moved` is how far the head stands from where the laser is to land: the
 offset, once the tool is in use. It is kept exact through a move that
 stops short, so Done always takes the head back to the spot, and it is
@@ -60,6 +68,7 @@ MOVE_FEED = 600.0       # mm/min: the tool's own moves, slow enough to watch (10
 POS_TOL = 0.05          # mm: a move that ended this close to its target reached it
 SETTLE_S = 60.0         # the longest a move may take to come to rest
 RELEASE_POLL_S = 2.0    # how often the operator's release is looked for
+MARK_HALF_MM = 1.5      # the calibration mark: a plus sign reaching this far from the spot each way
 
 MARK_DONE = "The laser is on the spot the crosshair marked. Start the job from the current position."
 
@@ -154,13 +163,22 @@ class Tool:
                     raise Refused("a jog is up to 100 mm in X and Y")
                 self.jobs.append(("jog", (x, y)))
             elif path == "/calibrate/burned":
-                self.jobs.append(("burned", bool(body.get("ok"))))
+                ok = bool(body.get("ok"))
+                self.jobs.append(("burned", (ok, str(body.get("why") or "")[:200])))
             else:
                 self.jobs.append((path.strip("/").replace("/", "."), None))
             if path == "/on":
                 self.state, self.error, self.message = "starting", "", ""
             elif path == "/off":
                 self.state, self.error = "stopping", ""
+            elif path == "/calibrate/burn":
+                self.state, self.error = "checking", ""
+                self.message = "Checking that the mark fits: the head traces it without the laser…"
+            elif path == "/calibrate/burned":
+                # Out of "burning" at once, so the word that the burn ended is taken once: a repeat is
+                # refused rather than moving the head by the offset again.
+                self.state, self.error = "showing", ""
+                self.message = "Moving the head by the offset so the camera sees the mark…" if ok else ""
             elif path != "/cancel":
                 self.error = ""
             self.wake.notify()
@@ -219,13 +237,21 @@ class Tool:
         if err is not None:
             raise err
         if abs(here[0] - start[0] - dx) > POS_TOL or abs(here[1] - start[1] - dy) > POS_TOL:
-            raise Refused("the move stopped %.2f, %.2f mm short" % (start[0] + dx - here[0], start[1] + dy - here[1]))
+            raise Refused("the move stopped short of where it was going")
 
     def home_to_spot(self, why=""):
-        """The head back to the spot, then the sender back in, and the tool off."""
+        """The head back to the spot, then the sender back in, and the tool off. The machine is given
+        back whatever the move does: a head that cannot reach the spot is left where it stopped, and
+        the message says how far the laser is from the spot."""
+        missed = None
         if self.moved:
-            self.shift(-self.moved[0], -self.moved[1], MOVE_FEED)
+            try:
+                self.shift(-self.moved[0], -self.moved[1], MOVE_FEED)
+            except Exception as e:
+                if self.moved:
+                    missed = self.m.words(e)
         self.fire = None
+        self.moved = None
         self.forget()
         try:
             self.m.sender_out(False)
@@ -233,6 +259,10 @@ class Tool:
             self.error = "the Grbl sender was not let back in: %s" % self.m.words(e)
         self.state = "off"
         self.message = why or MARK_DONE
+        if missed:
+            self.message = ""
+            self.error = ("the head did not get back (%s): the laser is not on the spot the crosshair marked, so "
+                          "move it there before a job" % missed)
 
     def offset_now(self):
         self.cfg = self.m.settings()
@@ -244,6 +274,8 @@ class Tool:
             raise Refused("the machine is not idle")
         if st.get("motors_released"):
             raise Refused("the X and Y motors are released: energize them first")
+        if (int(num(st.get("homed_axes"), 0)) & 3) != 3:
+            raise Refused("the machine is not homed: home it first, so the head's moves stay inside the work area")
         return st
 
     # ---- what the worker does -------------------------------------------------------------
@@ -286,24 +318,40 @@ class Tool:
         s = self.cfg
         power = int(round(num(s.get("burn_power"), 20) * 10))
         feed = int(round(num(s.get("burn_feed"), 600)))
-        program = "\n".join(["G21", "G91", "M4 S%d" % power, "G0 X-1.5", "G1 X3 F%d" % feed, "G0 X-1.5 Y-1.5",
-                             "G1 Y3", "G0 Y-1.5", "M5", "G90", ""])
+        r = MARK_HALF_MM
+        program = "\n".join(["G21", "G91", "M4 S%d" % power, "G0 X-%g" % r, "G1 X%g F%d" % (2 * r, feed),
+                             "G0 X-%g Y-%g" % (r, r), "G1 Y%g" % (2 * r), "G0 Y-%g" % r, "M5", "G90", ""])
         try:
+            self.trace_mark()
             self.m.job(program)
-        except Exception:
+        except Exception as e:
             self.fire = None
-            try:
-                self.m.sender_out(False)
-            except Exception:
-                pass
-            raise
-        self.state = "burning"
-        self.message = "Press the button on the machine when it lights. The mark burns where the laser is."
+            if not self.moved:
+                try:
+                    self.m.sender_out(False)
+                except Exception:
+                    pass
+            raise Refused("nothing burned: %s" % Machine.words(e))
+        # Frozen from here until the job ends: the page follows the burn through the machine.
+        self.state, self.message = "burning", ""
 
-    def burned(self, ok):
+    def trace_mark(self):
+        """Take the head, without the laser, to two opposite corners of the mark's square and back to
+        the spot. The controller refuses a move that would leave the work envelope, so a mark that does
+        not fit is refused here, before anything burns; the head ends on the spot either way."""
+        r = MARK_HALF_MM
+        try:
+            self.shift(-r, -r, MOVE_FEED)
+            self.shift(2 * r, 2 * r, MOVE_FEED)
+        finally:
+            if self.moved:
+                self.shift(-self.moved[0], -self.moved[1], MOVE_FEED)
+
+    def burned(self, ok, why=""):
         if not ok:
             self.fire = None
             self.state, self.message = "off", ""
+            self.error = "the mark was not burned" + (": " + why if why else "")
             self.m.sender_out(False)
             return
         offset = self.offset_now()
@@ -325,7 +373,7 @@ class Tool:
         self.remember()
         self.fire = None
         self.state = "on"
-        self.message = "Saved: the camera sees the bed %.2f mm, %.2f mm from the laser." % (ox, oy)
+        self.message = "Saved: the tool uses the calibrated offset from now on."
 
     def run_one(self, what, arg):
         try:
@@ -340,7 +388,7 @@ class Tool:
             elif what == "calibrate.burn":
                 self.burn()
             elif what == "burned":
-                self.burned(arg)
+                self.burned(*arg)
             elif what == "calibrate.save":
                 self.save()
             elif what == "calibrate.cancel":
