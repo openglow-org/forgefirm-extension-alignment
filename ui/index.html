@@ -234,6 +234,7 @@ var ffx = (function () {
     burnSent = false,             /* the service was told this burn ended */
     burnTimer = null,             /* following a burn, faster than the service is asked */
     IMP = false,                  /* the panel shows inches */
+    ME = '',                      /* this package's id, from ffx.self() */
     nstep = 1,                    /* the blue crosshair's nudge, in pixels */
     shownHtml = {},               /* what each re-rendered part holds now */
     fitted = 0,                   /* the frame height last asked for */
@@ -485,16 +486,28 @@ var ffx = (function () {
   /* The burn is a job, and the service is frozen from the moment the job is
    * armed until it ends, so the page follows it through the machine: the
    * button's wait, then the job's own record. Once the job has ended and the
-   * service answers again, still "burning", it is told, once. */
+   * service answers again, still "burning", it is told, once.
+   *
+   * The press is asked for only when the job waiting for it is this tool's:
+   * the record running in this package's name (job:<id>), the controller
+   * waiting for the press, and the Grbl sender kept out by this package, so
+   * that only its service can have sent the job. Any other job that waits
+   * for the press is named instead, and the press is not asked for. */
   function followBurn() {
     Promise.all([ffx.machine.status(), ffx.motion.jobState()]).then(function (a) {
-      var rep = a[0] && a[0].grbl && a[0].grbl.report,
+      var st = a[0] || {},
+        rep = st.grbl && st.grbl.report,
         arming = !!(rep && rep.laser && rep.laser.arming),
         rec = a[1] || {},
+        keeper = st.sender_out && st.sender_out.holder && st.sender_out.holder.id,
+        ours = !!ME && rec.state === 'running' && rec.owner === 'job:' + ME && keeper === ME,
         ended = rec.state === 'done' || rec.state === 'failed';
       if (T.state !== 'checking' && T.state !== 'burning') return;
       if (T.state === 'checking' && !frozen) return;   /* no job yet: the record is the last one's */
-      $('busytext').textContent = arming ? 'The button on the machine is lit: press it to burn the mark.'
+      $('busytext').textContent = arming && ours ? 'The button on the machine is lit: press it to burn the mark.'
+        : arming ? 'Another job waits for the button on the machine (' +
+          (rec.state === 'running' && rec.owner && rec.owner !== 'job:' + ME ? rec.owner : 'not this tool\'s') +
+          '): do not press it for the mark.'
         : !ended ? 'Burning the mark…'
         : rec.state === 'done' ? 'The mark is burned.' : 'The mark was not burned.';
       if (!ended || T.state !== 'burning' || frozen || burnSent) return;
@@ -613,6 +626,7 @@ var ffx = (function () {
   ffx.self()
     .then(function (me) {
       IMP = me.units === 'imperial';
+      ME = typeof me.id === 'string' ? me.id : '';
     }, function () {})
     .then(function () {
       renderSteps();

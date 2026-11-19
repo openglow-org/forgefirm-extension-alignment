@@ -4,7 +4,9 @@
 #
 # org.openglow.alignment: a page, and the service that keeps the tool
 # (bin/run.py, Python, with the SDK's lib/ffx.py). `make test` runs the
-# service's test. `make stage` lays out what the package ships - the
+# service's test, then the page's in headless Chrome (with no Chrome the
+# page's test exits 77, passed by here; under GitHub Actions it fails
+# instead). `make stage` lays out what the package ships - the
 # manifest, the page, the service and its library, and nothing of the
 # repository's own files - in build/pkg, and `make pack` packs it with ffx
 # (KEY=<file.priv> signs it). FFX is forgeext's tools/ffx: a sibling
@@ -14,6 +16,7 @@ FFX ?= ../forgeext/tools/ffx
 
 test:
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/service_test.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/page_test.py || [ $$? -eq 77 ]
 
 stage: manifest.json ui/index.html bin/run.py lib/ffx.py
 	rm -rf build/pkg

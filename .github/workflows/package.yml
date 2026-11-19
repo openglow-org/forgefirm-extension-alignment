@@ -3,7 +3,7 @@
 # SPDX-License-Identifier:    MIT
 
 # This package's CI and its releases, by forgeext's shared workflow. On every
-# push and pull request: the service's test (make test), then the package
+# push and pull request: the service's and the page's tests (make test), then the package
 # staged as it ships (make stage), linted as the machine judges it, and
 # packed. On main, a manifest version with no
 # release yet is signed with EXTENSION_SIGNING_KEY, the extension-signing
